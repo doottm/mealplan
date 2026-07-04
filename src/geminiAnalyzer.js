@@ -88,7 +88,7 @@ ${prevMealContext}
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { temperature: 0.2, maxOutputTokens: 4096, response_mime_type: 'application/json' }
+        generationConfig: { temperature: 0.2, maxOutputTokens: 4096 }
       })
     });
     if (!response.ok) return null;
