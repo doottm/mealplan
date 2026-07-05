@@ -22,7 +22,7 @@ import {
 } from 'lucide-react';
 import { analyzeMealPlan } from './analyzer';
 import { analyzeMealPlanWithGemini } from './geminiAnalyzer';
-import { syncToSheets } from './sheetsSync';
+import { syncToSheets, loadFromSheets } from './sheetsSync';
 import './App.css';
 
 function App() {
@@ -169,6 +169,7 @@ function App() {
 
   // 날짜 스위칭 감지 및 동기화
   useEffect(() => {
+    // 1. 우선 로컬 스토리지 데이터로 빠른 UI 렌더링
     const dayData = loadDayData(currentDate);
     if (dayData) {
       setMealText(dayData.text);
@@ -188,6 +189,23 @@ function App() {
       }
       setRevisions([]);
     }
+
+    // 2. 백그라운드에서 Google Sheets DB를 조회하여 최신 데이터로 동기화 (다중 브라우저 동기화)
+    const fetchCloudData = async () => {
+      const cloudData = await loadFromSheets(currentDate);
+      if (cloudData && cloudData.text) {
+        // 클라우드 데이터가 존재하고, 로컬과 텍스트가 다르다면 클라우드(DB) 데이터를 강제 우선 적용
+        if (!dayData || dayData.text !== cloudData.text) {
+          console.log('[Sync] 클라우드 DB에서 최신 데이터 동기화 완료');
+          setMealText(cloudData.text);
+          setAnalysis(cloudData.analysis);
+          setMealItems(parseTextToMealItems(cloudData.text));
+          // 로컬 스토리지도 최신 DB 데이터로 갱신
+          saveDayData(currentDate, cloudData.text, cloudData.analysis, dayData?.revisions || []);
+        }
+      }
+    };
+    fetchCloudData();
   }, [currentDate]);
 
   // mealItems 가 바뀔 때 텍스트를 컴파일하여 mealText 및 analysis 갱신
