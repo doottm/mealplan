@@ -61,3 +61,58 @@ export async function loadRangeFromSheets(days = 7) {
     return [];
   }
 }
+
+/**
+ * 특정 날짜의 식단 기록을 Google Sheets에서 완전 삭제합니다.
+ * @param {string} date - YYYY-MM-DD 형식 날짜
+ */
+export async function deleteFromSheets(date) {
+  if (!API_BASE) return;
+  try {
+    await fetch(`${API_BASE}/api/sheets/delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ date })
+    });
+  } catch (e) {
+    console.warn('[SheetsSync] 삭제 실패 (무시):', e.message);
+  }
+}
+
+/**
+ * Google Sheets Settings 탭에서 비밀번호를 가져옵니다.
+ * @returns {Promise<string>} 비밀번호 문자열 (기본: '0000')
+ */
+export async function getPassword() {
+  if (!API_BASE) return '0000';
+  try {
+    const res = await fetch(`${API_BASE}/api/settings/password`);
+    if (!res.ok) return '0000';
+    const data = await res.json();
+    return data.password || '0000';
+  } catch (e) {
+    return '0000';
+  }
+}
+
+/**
+ * 이미지를 base64로 변환하여 Gemini Vision 분석을 요청합니다.
+ * @param {string} imageBase64 - base64 인코딩된 이미지
+ * @param {string} mimeType - 이미지 MIME 타입
+ * @returns {Promise<object|null>} 감지된 음식 목록
+ */
+export async function analyzeImageViaBackend(imageBase64, mimeType = 'image/jpeg') {
+  if (!API_BASE) return null;
+  try {
+    const res = await fetch(`${API_BASE}/api/analyze-image`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ imageBase64, mimeType })
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (e) {
+    console.warn('[SheetsSync] 이미지 분석 실패:', e.message);
+    return null;
+  }
+}

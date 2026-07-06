@@ -31,7 +31,8 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '10mb' }));
+
 
 // ─── Google Sheets 클라이언트 초기화 ─────────────────────────
 function getSheetsClient() {
@@ -52,6 +53,8 @@ function getSheetsClient() {
 
 const SHEET_ID = process.env.GOOGLE_SHEET_ID;
 const SHEET_TAB = 'MealLogs'; // 시트 탭 이름
+const SETTINGS_TAB = 'Settings'; // 설정 탭 이름
+
 
 // ─── 헬스체크 ─────────────────────────────────────────────
 app.get('/', (req, res) => {
@@ -292,10 +295,161 @@ app.get('/api/sheets/range', async (req, res) => {
   }
 });
 
-// ─── 서버 시작 ─────────────────────────────────────────────
+// ─── [DELETE] /api/sheets/delete — 특정 날짜 레코드 완전 삭제 ──
+app.post('/api/sheets/delete', async (req, res) => {
+  const { date } = req.body;
+  if (!date || !SHEET_ID) return res.status(400).json({ error: 'date required' });
+
+  const sheets = getSheetsClient();
+  if (!sheets) return res.status(503).json({ error: 'Sheets not configured' });
+
+  try {
+    // 1. 모든 행 조회
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: SHEET_ID,
+      range: `${SHEET_TAB}!A:A`
+    });
+    const rows = response.data.values || [];
+
+    // 2. 삭제할 행 인덱스 수집 (1-based, 헤더 제외)
+    const deleteRequests = [];
+    rows.forEach((row, i) => {
+      if (i > 0 && row[0] === date) {
+        deleteRequests.push(i); // 0-based index
+      }
+    });
+
+    if (deleteRequests.length === 0) return res.json({ success: true, deleted: 0 });
+
+    // 3. 역순서 삭제 (Sheets API는 실제 행 되돌리기 방식)
+    const sheetIdRes = await sheets.spreadsheets.get({ spreadsheetId: SHEET_ID });
+    const sheetObj = sheetIdRes.data.sheets.find(s => s.properties.title === SHEET_TAB);
+    const sheetGid = sheetObj?.properties?.sheetId ?? 0;
+
+    const deleteOps = [...deleteRequests].sort((a, b) => b - a).map(rowIdx => ({
+      deleteDimension: {
+        range: {
+          sheetId: sheetGid,
+          dimension: 'ROWS',
+          startIndex: rowIdx,
+          endIndex: rowIdx + 1
+        }
+      }
+    }));
+
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: SHEET_ID,
+      requestBody: { requests: deleteOps }
+    });
+
+    console.log(`[/api/sheets/delete] ${date} - ${deleteRequests.length}줄 삭제 완료`);
+    res.json({ success: true, deleted: deleteRequests.length });
+  } catch (err) {
+    console.error('[/api/sheets/delete] 오류:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── [POST] /api/analyze-image — Gemini Vision 이미지 식단 분석 ──
+app.post('/api/analyze-image', async (req, res) => {
+  const { imageBase64, mimeType = 'image/jpeg' } = req.body;
+  const apiKey = process.env.GEMINI_API_KEY;
+
+  if (!apiKey) return res.status(500).json({ error: 'GEMINI_API_KEY not configured' });
+  if (!imageBase64) return res.status(400).json({ error: 'imageBase64 required' });
+
+  const prompt = `이 사진에서 보이는 음식을 분석하세요. 한국 음식을 위주로 분석하되, 외국 음식도 포함하세요.
+다음 JSON 형식으로만 응답하세요 (마크다운 코드블록 없이 순수 JSON만):
+{
+  "detectedFoods": [
+    { "name": "음식이름", "quantity": 1, "unit": "인분", "kcal": 350, "description": "간략한 설명" }
+  ],
+  "summary": "사진에 있는 음식 요약"
+}
+
+쓰여지지 않은 음식이거나 식별이 어려운 경우 null을 제외하고 신뢰할 수 있는 항목만 포함하세요.`;
+
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${apiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{
+            parts: [
+              { text: prompt },
+              { inline_data: { mime_type: mimeType, data: imageBase64 } }
+            ]
+          }],
+          generationConfig: { temperature: 0.1, maxOutputTokens: 1024 }
+        })
+      }
+    );
+
+    if (!response.ok) {
+      const errBody = await response.text();
+      console.error('[Vision] API 오류:', response.status, errBody);
+      return res.status(502).json({ error: 'Vision API error', detail: response.status });
+    }
+
+    const data = await response.json();
+    const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!rawText) return res.status(502).json({ error: 'Empty response' });
+
+    const cleaned = rawText.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/\s*```$/i, '').trim();
+    const result = JSON.parse(cleaned);
+    res.json(result);
+  } catch (err) {
+    console.error('[/api/analyze-image] 오류:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── [GET] /api/settings/password — 비밀번호 조회 ──
+app.get('/api/settings/password', async (req, res) => {
+  const sheets = getSheetsClient();
+  if (!sheets || !SHEET_ID) return res.json({ password: '0000' }); // 폴백용 기본값
+
+  try {
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: SHEET_ID,
+      range: `${SETTINGS_TAB}!A1`
+    });
+    const val = response.data.values?.[0]?.[0] || '0000';
+    res.json({ password: val });
+  } catch (err) {
+    // Settings 탭이 없으면 기본값 반환
+    res.json({ password: '0000' });
+  }
+});
+
+// ─── [POST] /api/settings/password — 비밀번호 저장 ──
+app.post('/api/settings/password', async (req, res) => {
+  const { password } = req.body;
+  if (!password) return res.status(400).json({ error: 'password required' });
+
+  const sheets = getSheetsClient();
+  if (!sheets || !SHEET_ID) return res.status(503).json({ error: 'Sheets not configured' });
+
+  try {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: SHEET_ID,
+      range: `${SETTINGS_TAB}!A1`,
+      valueInputOption: 'RAW',
+      requestBody: { values: [[password]] }
+    });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[/api/settings/password] 오류:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── 서버 시작 ────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`✅ DOO'S MEAL PLAN API Server running on port ${PORT}`);
-  console.log(`   Gemini API: ${process.env.GEMINI_API_KEY ? '✓ configured' : '✗ missing'}`);
-  console.log(`   Google Sheets: ${process.env.GOOGLE_SERVICE_ACCOUNT_JSON ? '✓ configured' : '✗ missing'}`);
-  console.log(`   Sheet ID: ${SHEET_ID || '✗ missing'}`);
+  console.log(`\u2705 DOO'S MEAL PLAN API Server running on port ${PORT}`);
+  console.log(`   Gemini API: ${process.env.GEMINI_API_KEY ? '\u2713 configured' : '\u2717 missing'}`);
+  console.log(`   Google Sheets: ${process.env.GOOGLE_SERVICE_ACCOUNT_JSON ? '\u2713 configured' : '\u2717 missing'}`);
+  console.log(`   Sheet ID: ${process.env.GOOGLE_SHEET_ID || '\u2717 missing'}`);
 });

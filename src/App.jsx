@@ -22,7 +22,8 @@ import {
 } from 'lucide-react';
 import { analyzeMealPlan } from './analyzer';
 import { analyzeMealPlanWithGemini } from './geminiAnalyzer';
-import { syncToSheets, loadFromSheets } from './sheetsSync';
+import { syncToSheets, loadFromSheets, deleteFromSheets, getPassword, analyzeImageViaBackend } from './sheetsSync';
+
 import './App.css';
 
 function App() {
@@ -89,8 +90,21 @@ function App() {
   const [isOnline, setIsOnline] = useState(navigator.onLine);
   const [showPwaModal, setShowPwaModal] = useState(false);
   const [isSavedAlert, setIsSavedAlert] = useState(false);
-  const [isAiAnalyzing, setIsAiAnalyzing] = useState(false); // Gemini AI 분석 중 상태
-  const aiAnalyzeTimeoutRef = useRef(null); // AI 분석 요청 디바운스용
+  const [isAiAnalyzing, setIsAiAnalyzing] = useState(false);
+  const aiAnalyzeTimeoutRef = useRef(null);
+  // 도어락
+  const [isAuthenticated, setIsAuthenticated] = useState(() => sessionStorage.getItem('doo-auth') === '1');
+  const [lockInput, setLockInput] = useState('');
+  const [lockError, setLockError] = useState('');
+  const [lockPassword, setLockPassword] = useState('0000');
+  // 사진 분석
+  const [isAnalyzingImage, setIsAnalyzingImage] = useState(false);
+  const [showImagePreview, setShowImagePreview] = useState(null); // base64 preview
+  const [imageFoods, setImageFoods] = useState([]); // 감지된 음식 목록
+  const photoInputRef = useRef(null);
+  // AI 분석 캐싱: 사용자 직접 액션 여부 추적
+  const userActionRef = useRef(false);
+
 
   // currentDate 기준 1일 전 날짜의 마지막 식사 시간을 가져오는 유틸리티
   const getPrevDayLastMeal = (currentDateStr) => {
@@ -167,6 +181,11 @@ function App() {
     };
   }, []);
 
+  // 앱 시작 시 비밀번호 불러오기
+  useEffect(() => {
+    getPassword().then(pw => setLockPassword(pw));
+  }, []);
+
   // 날짜 스위칭 감지 및 동기화
   useEffect(() => {
     // 1. 우선 로컬 스토리지 데이터로 빠른 UI 렌더링
@@ -209,18 +228,32 @@ function App() {
   }, [currentDate]);
 
   // mealItems 가 바뀔 때 텍스트를 컴파일하여 mealText 및 analysis 갱신
-  // 1단계: 로컬 Heuristic 분석으로 즉시 표시 (블로킹 없음)
-  // 2단계: Gemini AI 분석으로 비동기 갱신 (딜레이 후 정확한 수치로 덮어씌움)
+  // - 사용자 직접 액션(추가/삭제) 시에만 Gemini AI 호출 (캐싱 적용)
+  // - 단순 날짜 변경/새로고침 시는 저장된 실적 그대로 표시
   useEffect(() => {
     const compiledText = mealItems.map(item => `${item.time} ${item.menu}`).join('\n');
     setMealText(compiledText);
 
-    // 1단계: 로컬 분석 즉시 반영
+    // 사용자 직접 액션이 아닌 경우 (cloud sync, 날짜 변경, 새로고침)
+    // 로콜 분석만 하고 Gemini AI는 호출하지 않음
+    if (!userActionRef.current) {
+      // 로컴 저장된 analysis를 그대로 유지 (이미 setAnalysis 되어있음)
+      const localResult = analyzeMealPlan(compiledText, getPrevDayLastMeal(currentDate));
+      if (!loadDayData(currentDate)?.analysis) {
+        setAnalysis(localResult);
+      }
+      saveDayData(currentDate, compiledText, analysis, revisions);
+      return;
+    }
+    // 사용자 액션 플래그 리셋
+    userActionRef.current = false;
+
+    // 1단계: 로컴 분석 즉시 반영
     const localResult = analyzeMealPlan(compiledText, getPrevDayLastMeal(currentDate));
     setAnalysis(localResult);
     saveDayData(currentDate, compiledText, localResult, revisions);
 
-    // 2단계: Gemini AI 분석 (디바운스 500ms — 연속 입력 시 마지막 요청만 전송)
+    // 2단계: Gemini AI 분석 (디바운스 500ms)
     if (aiAnalyzeTimeoutRef.current) clearTimeout(aiAnalyzeTimeoutRef.current);
     if (!compiledText.trim()) return;
 
@@ -231,22 +264,21 @@ function App() {
         if (aiResult) {
           setAnalysis(aiResult);
           saveDayData(currentDate, compiledText, aiResult, revisions);
-          // Google Sheets에 비동기 동기화 (논블로킹)
           syncToSheets(currentDate, compiledText, aiResult);
         }
       } catch (e) {
-        console.warn('[App] Gemini AI 분석 실패, 로컬 결과 유지:', e);
+        console.warn('[App] Gemini AI 분석 실패, 로컴 결과 유지:', e);
       } finally {
         setIsAiAnalyzing(false);
       }
     }, 500);
   }, [mealItems]);
 
+
   // 식사 타임라인 추가 핸들러
   const handleAddMealItem = () => {
     if (!inputMenu.trim()) return;
-    
-    // 동일한 시간대가 이미 등록되어 있는지 확인
+    userActionRef.current = true; // 명시적 사용자 액션 플래그
     const existingIdx = mealItems.findIndex(item => item.time === inputTime);
     let updated;
     if (existingIdx > -1) {
@@ -255,21 +287,20 @@ function App() {
     } else {
       updated = [...mealItems, { time: inputTime, menu: inputMenu.trim() }];
     }
-    
     updated.sort((a, b) => a.time.localeCompare(b.time));
     setMealItems(updated);
-    setInputMenu(''); // 입력 필드 초기화
-    
-    // 알림 표시
+    setInputMenu('');
     setIsSavedAlert(true);
     setTimeout(() => setIsSavedAlert(false), 2000);
   };
 
   // 식사 타임라인 삭제 핸들러
   const handleDeleteMealItem = (index) => {
+    userActionRef.current = true; // 명시적 사용자 액션 플래그
     const updated = mealItems.filter((_, idx) => idx !== index);
     setMealItems(updated);
   };
+
 
   // 수동 식단 분석 요청 (로컬 즉시 + Gemini AI 업데이트)
   const handleAnalyze = async () => {
@@ -448,10 +479,85 @@ function App() {
     }
   };
 
-  // 텍스트 비우기
-  const handleClearText = () => {
+  // 일정 완전 초기화 (로컸 + DB 모두 삭제)
+  const handleClearAllMeals = async () => {
+    if (!window.confirm(`${formatDisplayDate(currentDate)}의 식단 일정을 모두 삭제하시겠습니까?\nDB에서도 완전히 제거됩니다.`)) return;
+
+    userActionRef.current = true;
+    setMealItems([]);
     setMealText('');
+    setAnalysis(analyzeMealPlan(''));
+    setRevisions([]);
+
+    // 로컸 스토리지에서 제거
+    try {
+      const stored = JSON.parse(localStorage.getItem('doo-mealplan-data') || '{}');
+      delete stored[currentDate];
+      localStorage.setItem('doo-mealplan-data', JSON.stringify(stored));
+    } catch (e) { /* ignore */ }
+
+    // Google Sheets DB에서도 제거
+    deleteFromSheets(currentDate);
   };
+
+  // 사진 촬영 → Gemini Vision 분석 핸들러
+  const handlePhotoSelected = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    e.target.value = '';
+
+    const reader = new FileReader();
+    reader.onload = async (ev) => {
+      const dataUrl = ev.target.result;
+      setShowImagePreview(dataUrl);
+      setIsAnalyzingImage(true);
+      setImageFoods([]);
+
+      try {
+        // base64 추출 (data:image/jpeg;base64, 제거)
+        const base64 = dataUrl.split(',')[1];
+        const mimeType = file.type || 'image/jpeg';
+        const result = await analyzeImageViaBackend(base64, mimeType);
+
+        if (result?.detectedFoods?.length > 0) {
+          setImageFoods(result.detectedFoods);
+        } else {
+          alert('음식을 감지하지 못했습니다. 다시 시도해 주세요.');
+          setShowImagePreview(null);
+        }
+      } catch (err) {
+        alert('사진 분석 중 오류가 발생했습니다.');
+        setShowImagePreview(null);
+      } finally {
+        setIsAnalyzingImage(false);
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+  // 사진 분석 결과를 식단에 추가
+  const handleAddImageFoods = () => {
+    if (imageFoods.length === 0) return;
+    userActionRef.current = true;
+    const now = new Date();
+    const timeStr = `${String(now.getHours()).padStart(2, '0')}:00`;
+    const menuStr = imageFoods.map(f => `${f.name} ${f.quantity}${f.unit}`).join(', ');
+    const existingIdx = mealItems.findIndex(item => item.time === timeStr);
+    let updated;
+    if (existingIdx > -1) {
+      updated = [...mealItems];
+      updated[existingIdx].menu += `, ${menuStr}`;
+    } else {
+      updated = [...mealItems, { time: timeStr, menu: menuStr }];
+    }
+    updated.sort((a, b) => a.time.localeCompare(b.time));
+    setMealItems(updated);
+    setShowImagePreview(null);
+    setImageFoods([]);
+    setIsSavedAlert(true);
+    setTimeout(() => setIsSavedAlert(false), 2000);
+  };
+
 
   // 과거 특정 날짜 선택 및 탭 포커싱 브릿지
   const handleSelectPastDay = (dateStr) => {
@@ -490,11 +596,105 @@ function App() {
     <div className="app-wrapper">
       <div className="status-bar-spacer"></div>
 
+      {/* ===== 도어락 화면 ===== */}
+      {!isAuthenticated && (
+        <div style={{
+          position: 'fixed', inset: 0, zIndex: 9999,
+          background: 'linear-gradient(135deg, #0B0F19 0%, #1a1f35 100%)',
+          display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '28px'
+        }}>
+          <img src="/icons/logo.png" alt="logo" style={{ width: 90, height: 90, borderRadius: 20, boxShadow: '0 8px 32px rgba(0,0,0,0.5)' }} />
+          <div style={{ textAlign: 'center' }}>
+            <div style={{ fontSize: '1.4rem', fontWeight: 800, color: 'white', letterSpacing: '0.05em' }}>DOO'S MEAL PLAN</div>
+            <div style={{ fontSize: '0.82rem', color: 'rgba(255,255,255,0.45)', marginTop: 4 }}>4자리 비밀번호를 입력하세요</div>
+          </div>
+          <div style={{ display: 'flex', gap: 12 }}>
+            {[0,1,2,3].map(i => (
+              <div key={i} style={{
+                width: 18, height: 18, borderRadius: '50%',
+                background: i < lockInput.length ? 'hsl(245, 80%, 65%)' : 'rgba(255,255,255,0.15)',
+                border: '2px solid rgba(255,255,255,0.3)',
+                transition: 'background 0.2s'
+              }} />
+            ))}
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12, width: 220 }}>
+            {['1','2','3','4','5','6','7','8','9','','0','⌫'].map((k, idx) => (
+              <button key={idx}
+                onClick={() => {
+                  if (k === '') return;
+                  if (k === '⌫') {
+                    setLockInput(prev => prev.slice(0, -1));
+                    setLockError('');
+                  } else if (lockInput.length < 4) {
+                    const next = lockInput + k;
+                    setLockInput(next);
+                    if (next.length === 4) {
+                      if (next === lockPassword) {
+                        sessionStorage.setItem('doo-auth', '1');
+                        setIsAuthenticated(true);
+                        setLockInput('');
+                      } else {
+                        setLockError('비밀번호가 다릅니다');
+                        setTimeout(() => { setLockInput(''); setLockError(''); }, 800);
+                      }
+                    }
+                  }
+                }}
+                style={{
+                  background: k === '' ? 'transparent' : 'rgba(255,255,255,0.07)',
+                  border: k === '' ? 'none' : '1px solid rgba(255,255,255,0.12)',
+                  borderRadius: 12, color: 'white', fontSize: k === '⌫' ? '1.1rem' : '1.3rem',
+                  fontWeight: 600, padding: '16px 0', cursor: k === '' ? 'default' : 'pointer',
+                  transition: 'background 0.15s'
+                }}
+              >{k}</button>
+            ))}
+          </div>
+          {lockError && <div style={{ color: 'hsl(0,80%,65%)', fontSize: '0.85rem', fontWeight: 600 }}>{lockError}</div>}
+        </div>
+      )}
+
+      {/* ===== 이미지 분석 머드 ===== */}
+      {showImagePreview && (
+        <div style={{
+          position: 'fixed', inset: 0, zIndex: 9000,
+          background: 'rgba(0,0,0,0.85)', backdropFilter: 'blur(8px)',
+          display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 20, padding: 24
+        }}>
+          <img src={showImagePreview} alt="preview" style={{ maxWidth: '90vw', maxHeight: '40vh', borderRadius: 16, objectFit: 'contain' }} />
+          {isAnalyzingImage ? (
+            <div style={{ color: 'white', fontSize: '0.9rem' }}>🔍 Gemini가 음식을 분석 중...</div>
+          ) : imageFoods.length > 0 && (
+            <div style={{ background: 'rgba(255,255,255,0.08)', borderRadius: 14, padding: '16px 20px', width: '100%', maxWidth: 400 }}>
+              <div style={{ color: 'white', fontWeight: 700, marginBottom: 10 }}>🍽️ 감지된 음식</div>
+              {imageFoods.map((f, i) => (
+                <div key={i} style={{ display: 'flex', justifyContent: 'space-between', color: 'rgba(255,255,255,0.8)', fontSize: '0.85rem', marginBottom: 6 }}>
+                  <span>{f.name} {f.quantity}{f.unit}</span>
+                  <span style={{ color: 'hsl(245,80%,70%)' }}>{f.kcal} kcal</span>
+                </div>
+              ))}
+              <button
+                onClick={handleAddImageFoods}
+                style={{
+                  marginTop: 14, width: '100%', background: 'linear-gradient(135deg, hsl(245,80%,60%), hsl(280,70%,55%))',
+                  border: 'none', borderRadius: 10, color: 'white', fontWeight: 700, padding: '12px 0', cursor: 'pointer', fontSize: '0.9rem'
+                }}
+              >+ 식단에 추가하기</button>
+            </div>
+          )}
+          <button onClick={() => { setShowImagePreview(null); setImageFoods([]); }}
+            style={{ background: 'rgba(255,255,255,0.1)', border: 'none', borderRadius: 10, color: 'rgba(255,255,255,0.6)', padding: '10px 28px', cursor: 'pointer' }}>
+            닫기
+          </button>
+        </div>
+      )}
+
       {/* 헤더 바 */}
       <header className="app-header">
         <div className="brand">
           <div className="brand-icon" style={{ background: 'transparent', boxShadow: 'none' }}>
-            <img src="/icons/icon-64.png" alt="DOO" style={{ width: '100%', height: '100%', borderRadius: '8px', objectFit: 'contain' }} />
+            <img src="/icons/logo.png" alt="DOO" style={{ width: '100%', height: '100%', borderRadius: '8px', objectFit: 'contain' }} />
           </div>
           <h1 className="brand-name">DOO'S MEAL PLAN</h1>
         </div>
@@ -625,14 +825,18 @@ function App() {
                         <span style={{ color: 'var(--text-muted)', fontWeight: '700' }}>{meal.calories} kcal</span>
                       </div>
                     ))}
-                    {analysis.fastingIntervals && analysis.fastingIntervals.length > 0 && (
+                    {/* #7: 간밤 공복 시간만 표시 (주간 식사 사이 공복은 숨김) */}
+                    {analysis.fastingIntervals && analysis.fastingIntervals.filter(iv => iv.start && (iv.start.includes('전일') || iv.start.includes('어제'))).length > 0 && (
                       <div style={{ borderTop: '1px dashed var(--border-color)', marginTop: '10px', paddingTop: '10px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                        {analysis.fastingIntervals.map((interval, idx) => (
-                          <div key={idx} style={{ fontSize: '0.78rem', color: 'var(--primary)', fontWeight: '700', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                            <span>⏱️</span>
-                            <span>{interval.formatted}</span>
-                          </div>
-                        ))}
+                        {analysis.fastingIntervals
+                          .filter(iv => iv.start && (iv.start.includes('전일') || iv.start.includes('어제')))
+                          .slice(0, 1)
+                          .map((interval, idx) => (
+                            <div key={idx} style={{ fontSize: '0.78rem', color: 'var(--primary)', fontWeight: '700', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                              <span>⏱️</span>
+                              <span>{interval.formatted}</span>
+                            </div>
+                          ))}
                       </div>
                     )}
                   </div>
@@ -740,29 +944,42 @@ function App() {
                 </div>
               </div>
 
-              {/* 탄단지 3대 영양소 섭취 비율 그래프 */}
+              {/* #4: 탄단지 3대 영양소 - 하루 권장량 기준 % */}
+              {/* 권장량: 탄수화물 324g / 단백질 60g / 지방 54g (2000kcal 기준) */}
               <div className="macro-progress-container">
-                <div className="macro-bar-row">
-                  <span className="macro-name">탄수화물</span>
-                  <div className="macro-track">
-                    <div className="macro-fill carb" style={{ width: `${analysis.ratio.carb}%` }}></div>
-                  </div>
-                  <span className="macro-pct">{analysis.ratio.carb}%</span>
-                </div>
-                <div className="macro-bar-row">
-                  <span className="macro-name">단백질</span>
-                  <div className="macro-track">
-                    <div className="macro-fill protein" style={{ width: `${analysis.ratio.protein}%` }}></div>
-                  </div>
-                  <span className="macro-pct">{analysis.ratio.protein}%</span>
-                </div>
-                <div className="macro-bar-row">
-                  <span className="macro-name">지방</span>
-                  <div className="macro-track">
-                    <div className="macro-fill fat" style={{ width: `${analysis.ratio.fat}%` }}></div>
-                  </div>
-                  <span className="macro-pct">{analysis.ratio.fat}%</span>
-                </div>
+                {(() => {
+                  const DAILY_REC = { carb: 324, protein: 60, fat: 54 };
+                  const carbPct = Math.min(Math.round((analysis.carb || 0) / DAILY_REC.carb * 100), 150);
+                  const proteinPct = Math.min(Math.round((analysis.protein || 0) / DAILY_REC.protein * 100), 150);
+                  const fatPct = Math.min(Math.round((analysis.fat || 0) / DAILY_REC.fat * 100), 150);
+                  const overColor = 'hsl(0,80%,60%)';
+                  return (
+                    <>
+                      <div className="macro-bar-row">
+                        <span className="macro-name">탄수화물</span>
+                        <div className="macro-track">
+                          <div className="macro-fill carb" style={{ width: `${Math.min(carbPct, 100)}%`, background: carbPct > 100 ? overColor : undefined }}></div>
+                        </div>
+                        <span className="macro-pct" style={{ color: carbPct > 100 ? overColor : undefined }}>{carbPct}%</span>
+                      </div>
+                      <div className="macro-bar-row">
+                        <span className="macro-name">단백질</span>
+                        <div className="macro-track">
+                          <div className="macro-fill protein" style={{ width: `${Math.min(proteinPct, 100)}%`, background: proteinPct > 100 ? overColor : undefined }}></div>
+                        </div>
+                        <span className="macro-pct" style={{ color: proteinPct > 100 ? overColor : undefined }}>{proteinPct}%</span>
+                      </div>
+                      <div className="macro-bar-row">
+                        <span className="macro-name">지방</span>
+                        <div className="macro-track">
+                          <div className="macro-fill fat" style={{ width: `${Math.min(fatPct, 100)}%`, background: fatPct > 100 ? overColor : undefined }}></div>
+                        </div>
+                        <span className="macro-pct" style={{ color: fatPct > 100 ? overColor : undefined }}>{fatPct}%</span>
+                      </div>
+                      <div style={{ fontSize: '0.65rem', color: 'var(--text-muted)', textAlign: 'right', marginTop: 2 }}>탄수화물 324g / 단백질 60g / 지방 54g 기준</div>
+                    </>
+                  );
+                })()}
               </div>
             </div>
 
@@ -772,6 +989,10 @@ function App() {
                 <Sparkles size={14} color="var(--secondary)" />
                 식단 구성 및 입력
               </div>
+              {/* #5: 주식 입력 및 사진 촬영 */}
+              {/* hidden file input for camera */}
+              <input type="file" accept="image/*" capture="environment" ref={photoInputRef}
+                style={{ display: 'none' }} onChange={handlePhotoSelected} />
               
               {/* 드롭다운 + 텍스트 인풋 조합 입력 폼 */}
               <div className="time-input-form">
@@ -795,6 +1016,15 @@ function App() {
                     if (e.key === 'Enter') handleAddMealItem();
                   }}
                 />
+                <button
+                  title="사진으로 식단 분석"
+                  onClick={() => photoInputRef.current?.click()}
+                  style={{
+                    padding: '10px 13px', borderRadius: '10px', border: 'none',
+                    background: 'rgba(99,102,241,0.15)', color: 'hsl(245,80%,70%)',
+                    cursor: 'pointer', fontSize: '1.1rem', flexShrink: 0
+                  }}
+                >📸</button>
                 <button className="analyze-btn" style={{ padding: '10px 16px', borderRadius: '10px' }} onClick={handleAddMealItem}>
                   등록
                 </button>
@@ -823,9 +1053,10 @@ function App() {
                 </div>
               )}
 
+              {/* #3: 일정 초기화 (DB에서도 제거) */}
               <div className="action-row" style={{ marginTop: '16px', borderTop: '1px solid var(--border-color)', paddingTop: '14px' }}>
-                <button className="clear-btn" onClick={() => setMealItems([])}>
-                  일정 초기화
+                <button className="clear-btn" onClick={handleClearAllMeals}>
+                  일정 전체 삭제
                 </button>
                 <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
                   {isSavedAlert && (
